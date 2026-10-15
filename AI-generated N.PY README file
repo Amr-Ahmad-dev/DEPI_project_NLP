@@ -1,1 +1,998 @@
+# Dyslexia-Friendly Spelling & Grammar Corrector (from scratch, PyTorch)
 
+This README documents `grammar_corrector.py` completely: what each part does, how the data is turned
+into what the networks receive, why each choice was made, what the mathematics behind it says, what
+went wrong in earlier versions and why, and where the current design is still weak.
+
+> **Honest status note.** The script was written and reviewed carefully, and its torch-free parts
+> were executed (label logic, alignment, tokenizer, noise generator, leakage-free split, and the
+> pyspellchecker calls it depends on). The PyTorch training and inference code could **not** be run
+> where it was written (the environment ran out of disk while installing PyTorch). So: this README
+> describes the design as coded and the *reasons* behind it. Statements such as "this should improve
+> X" are expectations, not measurements. The only real measurements in this document are the
+> results of the **previous** version (Section 2). Run the script, then judge the design by its
+> printed tables.
+
+---
+
+## Table of contents
+
+1. [The task and its constraints](#1-the-task-and-its-constraints)
+2. [What went wrong before, and where each mistake came from](#2-what-went-wrong-before-and-where-each-mistake-came-from)
+3. [Architecture at a glance](#3-architecture-at-a-glance)
+4. [A note on "information" (what preprocessing can and cannot do)](#4-a-note-on-information-what-preprocessing-can-and-cannot-do)
+5. [The data pipeline, step by step](#5-the-data-pipeline-step-by-step)
+6. [Stage 1: the speller (data, model, training, decision rules)](#6-stage-1-the-speller)
+7. [Stage 2: the tagger (data, model, training, decision rules)](#7-stage-2-the-tagger)
+8. [Exactly what each model receives (tensors and shapes)](#8-exactly-what-each-model-receives)
+9. [How the optimization avoids the earlier failures](#9-how-the-optimization-avoids-the-earlier-failures)
+10. [Inference: how everything fits together](#10-inference-how-everything-fits-together)
+11. [Evaluation: what is measured and how to read it](#11-evaluation-what-is-measured-and-how-to-read-it)
+12. [Files produced, how to run, configuration reference](#12-files-produced-how-to-run-configuration-reference)
+13. [Limitations and gaps](#13-limitations-and-gaps)
+14. [Improvements, ranked by effort](#14-improvements-ranked-by-effort)
+15. [Troubleshooting checklist](#15-troubleshooting-checklist)
+16. [Glossary](#16-glossary)
+
+---
+
+## 1. The task and its constraints
+
+**Goal:** take text written by someone who spells and writes imperfectly (including dyslexic writers)
+and return the intended text:
+
+- spelling: `wnat → want`, `becuase → because`, phonetic spellings, swapped/dropped/doubled letters;
+- grammar: tense (`Yesterday I go → went`), agreement (`He have → has`), `their/there`, run-together
+  words (`alot → a lot`), and so on;
+- **meaning must not change.** `I did not want to go to the doctor.` must never become a sentence
+  without the `not`.
+
+**Constraints you set:** train from scratch (no pretrained models), use libraries freely, use the GPU,
+keep the best *and* the latest checkpoint and test both, avoid data leakage, avoid vanishing gradients.
+
+**Your data:** a *word* file (many misspellings of each correct word) and a *sentence* file (wrong
+sentence, correct sentence). The sentence file is small. Your earlier results had 201 test sentences,
+so the whole file is roughly 2,000 pairs. This single fact drives many design decisions below.
+
+---
+
+## 2. What went wrong before, and where each mistake came from
+
+### 2.1 The three versions
+
+| Version | Idea | Problem it ran into |
+|---|---|---|
+| v1: scikit-learn `MLPClassifier` | One token at a time. Input = hashed character n-grams of the previous, current and next token. Output class = **the corrected word**. | Closed vocabulary; row-level splits leaked; unequal-length sentence pairs skipped. |
+| v2: PyTorch window classifier | Same idea, bigger: ±3 token window, residual MLP, GPU, group split, `<copy>/<del>/word` labels. | Honest evaluation exposed the closed-vocabulary problem. Sentence results were no better than "do nothing". |
+| v3 (this file) | Two stages: open-vocabulary speller + sentence-level tagger with shareable edit labels, tuned thresholds. | Not yet measured (see status note). |
+
+### 2.2 The measured results of v2 (the only real numbers in this README)
+
+```
+words/target_reachable            0.0618     <- only 6% of correct words existed as output classes
+words/accuracy                    0.0015     (do-nothing 0.0027)
+sentence_tokens/accuracy          0.8436     (do-nothing 0.8526)   <- worse than doing nothing
+sentence_tokens/edit_recall       0.1327
+sentences/char_error_rate         0.1648     (do-nothing 0.1556)   <- worse than doing nothing
+best epoch                        5 of 11    <- overfitting early
+demo: deleted "Yesterday", "alot", "Wen"     <- harmful deletions
+```
+
+### 2.3 Root causes (why each number looked that way)
+
+**(a) Spelling was framed as classification over a closed set of words.**
+The output layer had one neuron per corrected word seen in training. A classifier can only output a
+class it has a neuron for. With a *group split* (all misspellings of a word kept together, which is the
+honest way to test), almost every test word is by definition a word that never appeared as a class:
+`target_reachable = 0.0618` means 93.8% of test words were impossible to get right, whatever the
+network learned. The earlier row-wise split had hidden this, because the same correct word appeared
+in both train and test. This was not a bug in training. It was a flaw in the *problem formulation*.
+
+**(b) The sentence data is tiny, and the labels were lexical.**
+`go → went` and `walk → walked` and `jump → jumped` were each a separate class with a handful of
+examples. With roughly 2,000 sentences, nearly every edit class was too rare to learn, so edit recall
+was 13%.
+
+**(c) Severe class imbalance.**
+About 85% of tokens need no change (do-nothing accuracy 0.8526). A model can minimise cross-entropy
+by almost always predicting "keep". Any model has to beat 0.8526, and v2 did not.
+
+**(d) Too little context.**
+A ±3 token window cannot see `Yesterday` from a verb far away. Tense is a sentence-level property.
+
+**(e) A loose confidence rule produced harmful deletions.**
+`<del>` predictions passed a 0.30 confidence threshold. Some `<del>` labels came from alignment noise
+(a deleted token in one pair is a legitimate keep in another), so the model learned deletions from
+noisy evidence and applied them confidently enough to pass 0.30.
+
+**(f) A large model on small data.**
+A 65k-bucket word embedding plus 512-wide blocks has enough capacity to memorise ~16k real training
+tokens. Best validation loss at epoch 5 of 11 is the classic signature.
+
+**(g) Data-pipeline leaks and losses in v1.**
+- Row-level splitting put tokens of the same sentence into different splits (their windows overlap,
+  so the model effectively saw parts of test sentences).
+- Pairs with different token counts were skipped, which silently removed exactly the run-together /
+  split-word errors (`alot`, `to day`) that matter for dyslexia.
+- Everything was lowercased and never restored.
+- Apostrophe-less negations (`dident`, `dont`) were not protected by the negation guard, which only
+  knew `didn't` and friends.
+
+**(h) GPU looked idle.**
+Per-step `.item()` calls forced the CPU and GPU to synchronise every step, the model per step was tiny,
+and most wall-clock time was single-threaded Python (tokenizing, aligning, hashing).
+
+---
+
+## 3. Architecture at a glance
+
+```
+raw text
+   │  tokens_cased / tok            (regex tokenizer, NFKC normalisation, lowercase copy)
+   ▼
+lowercase tokens ───────────────────────────────────────────────┐
+   │                                                            │ original-case tokens kept
+   ▼                                                            │ for re-casing at the end
+┌──────────────────────── STAGE 1: SpellStage ───────────────────────────┐
+│ per DISTINCT token (cached):                                           │
+│  1 non-alpha / < 3 chars                -> unchanged                   │
+│  2 "dont", "wasnt"...                    -> "don't", "wasn't"  (rule)   │
+│  3 unknown word 1 edit from a negation   -> that negation (rule)        │
+│  4 CharSpeller (Transformer seq2seq) proposes a word + probability      │
+│     accept if dictionary knows it OR model is confident                 │
+│     (for already-valid words: only a clearly commoner word, p >= 0.9)   │
+│  5 else pyspellchecker suggestion, else unchanged                       │
+│  never adds / removes a negation                                        │
+└──────────────────────────────────────────────────────────────────────┘
+   │ spell-corrected tokens
+   ▼
+┌──────────────────────── STAGE 2: SentenceTagger ───────────────────────┐
+│ char-n-gram bag + word hash per token -> Transformer encoder over the   │
+│ WHOLE sentence -> one label per token:                                  │
+│   <copy> | <del> | SUF|k|text (edit the ending) | REPL|text (replace)   │
+│ apply only if confidence >= tuned threshold (+margin for delete),       │
+│ then negation guards                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+   │ labels
+   ▼
+apply labels -> restore original capitalisation of untouched words -> detokenize
+-> capitalise sentence starts and "I" -> output text
+```
+
+Why two stages instead of one network: the two sub-problems have **different data regimes and
+different output spaces**.
+
+| | Speller | Tagger |
+|---|---|---|
+| Question | "What word did they mean?" | "Given a sequence of valid-looking words, which need to change?" |
+| Output space | any string up to 20 characters (open) | a small label set per token (closed, but shareable) |
+| Context needed | none (word only) | the whole sentence |
+| Data available | tens of thousands of word pairs + synthetic | ~2,000 sentence pairs + synthetic |
+| Model size | larger | smaller |
+
+---
+
+## 4. A note on "information" (what preprocessing can and cannot do)
+
+You asked why the processing "mathematically increases the information available to the model". The
+precise answer has two parts, and the first is a limit you should know.
+
+### 4.1 The limit: preprocessing cannot create information
+
+For random variables `Y` (the target), `X` (the raw input) and any deterministic function `T(X)` (a
+tokenizer, a hash, an embedding lookup), the **data processing inequality** says
+
+```
+I(Y ; T(X))  ≤  I(Y ; X)
+```
+
+where `I` is Shannon mutual information. Whatever the corrected word `Y` depends on in the raw text
+`X` is the ceiling. Stacking more representations cannot lift it. Hashing and mean-pooling can even
+*lose* information (collisions, order loss).
+
+### 4.2 What preprocessing can do: raise *usable* information
+
+A model is a finite-capacity predictor family `V` trained on finite data. What matters in practice is
+the information that family can extract, formalised as **usable (V-) information**:
+
+```
+I_V(X → Y)  =  H_V(Y)  −  H_V(Y | X)
+```
+
+where `H_V(Y | X)` is the lowest cross-entropy achievable by predictors in `V`. A representation can
+make `I_V` much larger than what `V` extracts from the raw form, even though the Shannon ceiling is
+unchanged. The mechanisms used in this file, each stated as a concrete mechanism:
+
+1. **Sharing statistical strength across inputs** (character n-grams, shared edit labels, synthetic
+   noise).
+2. **Making the needed context reachable** (whole-sentence attention).
+3. **Making the output space expressible** (open-vocabulary decoding, shareable edit scripts).
+4. **Removing misleading structure** (alignment instead of skipping, group splits).
+
+Each is derived in the sections where it is used.
+
+---
+
+## 5. The data pipeline, step by step
+
+Code references are to the numbered sections of `grammar_corrector.py`.
+
+### 5.1 Loading (`load_pairs`, section 4)
+
+- Reads each CSV with `dtype=str` (so nothing is parsed as a number), drops rows with a missing wrong
+  or correct text, strips whitespace, drops empty strings and **exact duplicate pairs**.
+- Output: lists of `(wrong_text, correct_text, kind)` where `kind` is `"word"` or `"sentence"`.
+
+*Why drop duplicates:* duplicates make a model look better on test data (the same pair can sit in both
+splits) and inflate frequent patterns. They are removed before any splitting.
+
+### 5.2 Tokenization (`normalize_text`, `tokens_cased`, `tok`, section 2)
+
+```python
+_TOKEN_RE = r"\w+(?:['\-]\w+)*|[^\w\s]"
+```
+
+- `normalize_text`: Unicode NFKC normalisation and conversion of curly quotes to straight ones, so
+  `didn’t` and `didn't` are one thing. (In v1 a curly apostrophe split the contraction and the
+  negation guard missed it.)
+- A token is either a word (letters/digits/underscore, optionally with inner apostrophes or hyphens, so
+  `didn't` and `well-known` stay whole) or **one** punctuation character. Whitespace is dropped.
+- `tokens_cased` keeps the original capitalisation; `tok` lowercases each token individually
+  (token-wise lowercasing guarantees the cased and lowercase lists have the same length).
+
+*Why lowercase for the models:* it halves the number of distinct forms the models must learn from
+little data. *Why keep the cased list:* so names and sentence starts can be restored (Section 10).
+
+### 5.3 Splitting without leakage (`group_split`, `remove_cross_leakage`)
+
+1. Each pair gets a **group key** = the tokenized *correct* text. All misspellings of `when`, or all
+   variants of one correct sentence, share one group.
+2. Group keys are sorted, shuffled with a seeded RNG, and the first 10% become test, the next 10%
+   validation, the rest train. **Whole groups** move together. This is done separately for the word
+   file and the sentence file, so both are represented in every split.
+3. After merging the two files, `remove_cross_leakage` removes any group that appears in more than one
+   split (a word can occur as a one-word "sentence" in the other file), and an `assert` stops the
+   program if train still intersects val/test.
+4. Only after this are pairs expanded into model examples.
+
+*Why this matters mathematically:* the reported test score estimates `E[loss on new data]`. If a test
+example's group also occurs in training, the model has seen (a near-copy of) the answer, the test is no
+longer an independent sample, and the estimate is biased upward. Splitting on the *correct* text is
+the right independence unit here because the question being tested is "can it correct something it
+has not seen the answer to". Splitting before expansion matters because one sentence becomes ~10
+overlapping token examples (their contexts share tokens).
+
+Residual leakage that remains by design (and is small): the speller's character vocabulary is built from
+train **and** validation characters (characters, not words); the dictionary library knows the words of
+the test set as English words (that is what a spell checker is).
+
+### 5.4 Word pairs → speller pairs (`single_token_pairs`)
+
+Keeps `(wrong_word, correct_word)` only when both sides are exactly one token, differ, and are at most
+`max_word_len` (20) characters.
+
+### 5.5 Mining spelling errors out of sentence pairs (`spelling_pairs_from_sentences`)
+
+The sentence file also contains real spelling mistakes. For each sentence pair, `difflib.SequenceMatcher`
+aligns the two token lists; wherever a block of tokens is replaced one-for-one, the pair `(w, c)` is kept
+as a spelling example if `w` and `c` are alphabetic, `w` is **not** a known English word, and
+`levenshtein(w, c) ≤ 3`. The "not a known word" filter prevents grammar changes like `go → goes`
+(both valid words) from being mistaken for spelling.
+
+### 5.6 Synthetic dyslexia-style noise (`corrupt_word`, `make_synthetic_spelling`)
+
+Source words: the 40,000 most frequent words of the pyspellchecker dictionary plus your training
+vocabulary, filtered to ASCII letters of length 3–20, **minus the correct words of your validation and
+test word pairs**. For each of 200,000 draws:
+
+- with probability 0.10 the pair is `(w, w)` (an identity pair that teaches "leave correct words
+  alone");
+- otherwise `w` is corrupted with 1–2 operations (chosen from 1,1,1,1,2,2) from: swap two adjacent
+  letters, drop a letter, double a letter, insert a random letter, apply a phonetic substitution
+  (`ph↔f`, `c↔k↔s`, `ie↔ei`, `tion→shun`, `ough→uff`, ...) twice as likely as the others, replace a
+  vowel with another vowel. Retried up to 10 times until the result actually differs.
+
+**Why this helps (noisy-channel view).** Spelling correction is Bayesian:
+
+```
+P(word | typed)  ∝  P(typed | word) · P(word)
+                      └ error model ┘   └ prior ┘
+```
+
+The speller is trained to output the word given the typed string, so across training it learns the
+posterior implied by the *training mixture*. Real pairs supply the true error model for your writers,
+but they are limited (tens of thousands of pairs, concentrated on whatever words your file covers).
+Synthetic pairs supply a **broad prior over words** and **many repetitions of each error type applied
+to many different letters/contexts**, so the network learns edit *patterns* (`"ph"→"f"` anywhere) and
+not just word-specific memories. Real pairs are repeated 3× (`real_repeat`) so the synthetic data does
+not dominate the mixture. With R real pairs the real share of the mixture is about `3R / (3R + 200,000)`.
+
+**Caveat (a real limitation):** words are drawn *uniformly* from the pool, not by frequency, so the
+network's implicit prior `P(word)` is not English word frequency. The pipeline compensates partly with
+dictionary frequency in the decision rules (Section 6.4), but a proper frequency-weighted rerank would
+be better (Section 14).
+
+### 5.7 Sentence pairs → tagger examples (`build_sentence_examples`)
+
+For each sentence pair:
+
+1. Tokenize both sides (lowercase). Skip if either is empty, or the wrong side exceeds 64 tokens.
+2. **Run the wrong tokens through the speller stage** (`spell.fix_tokens`). *Why:* at inference the
+   tagger only ever sees spell-corrected text. Training it on raw misspellings would mean a
+   train/inference mismatch (the model would train on `wnat` and see `want` in production).
+3. `align_outputs(wrong, correct)`: uses `SequenceMatcher` to match the two token lists and returns, for
+   **every wrong token, the text it should become** (`""` means deleted). Rules:
+   - equal block → unchanged;
+   - replace, same length → token-by-token replacement;
+   - replace, different length → the first wrong token gets the *whole* correct phrase
+     (`alot → "a lot"`), the others get `""` (deleted);
+   - delete → `""`;
+   - insert → the inserted words are appended to the *previous* token's output (or prepended to the
+     first token's output).
+4. `to_label(token, output)` converts that text into one of the four label types (Section 7.2).
+5. If more than 60% of tokens need an edit (`max_edit_ratio`), the pair is skipped. Such pairs are
+   rewrites (different phrasing), not corrections, and the alignment on them is mostly noise.
+
+*Why `SequenceMatcher` instead of skipping unequal pairs:* v1 discarded every pair whose token counts
+differed, which removed all run-together and split words. Alignment recovers them. (It is a heuristic
+longest-matching-block algorithm, not a minimum-edit alignment. See Limitations.)
+
+### 5.8 Synthetic tagger sentences (`build_synthetic_examples`)
+
+From the **correct** sides of *training* sentence pairs only (3–64 tokens), build 6 corrupted variants
+each. Each token that belongs to a confusion group has a 15% chance of being swapped for a random
+group-mate; the label for each token is what is needed to restore the original. Groups (hand-written,
+`CONFUSION_GROUPS`) include homophones (`their/there/they're`, `to/too`, `then/than`, `your/you're`...),
+agreement pairs (`is/are`, `was/were`, `has/have`, `does/do`, `a/an`) and verb forms
+(`go/went/gone/goes`, `buy/bought/buys`, `walk/walked/walks`, ...). **Negations are removed from the
+groups** (`build_confusion_lookup`), so synthetic data can never teach the model to flip a negation.
+
+*Why it helps:* the model sees the *same correct sentence* with different single-word errors, so the
+only thing that explains the label is the context. That is exactly the signal needed for
+`their/there` and tense. It multiplies the number of informative examples several-fold without
+touching the held-out data. Limit: it only covers the ~100 words in the groups.
+
+### 5.9 Class vocabulary for the tagger
+
+Count every label over the training examples (real + synthetic). Keep `<copy>`, `<del>` and every
+label with at least 3 occurrences (`min_class_count`). Labels rarer than that are mapped to **−100**
+("ignore"), meaning the model neither learns nor is penalised on those tokens. (This is better than
+mapping rare labels to `<copy>`, which would teach the model that a genuinely wrong token is fine.)
+
+### 5.10 Tensorization
+
+- Speller: `encode_words` → integer matrices (Section 8.1).
+- Tagger: a `TokenTable` assigns each distinct token a row number (0 reserved for padding) and stores
+  its hashed n-gram ids; `tensorize` builds `[sentences × 64]` integer matrices of token rows and a
+  matching label matrix (−100 on padding and ignored labels). **All of it is moved to the GPU once.**
+  Batches are slices of GPU tensors, trimmed to the longest sentence in the batch, so there is no
+  `DataLoader`, no per-batch CPU→GPU copying and no padding waste beyond the longest sentence.
+
+---
+
+## 6. Stage 1: the speller
+
+### 6.1 Representation: characters, not words
+
+The input is the sequence of characters of the (possibly misspelled) word; the output is the sequence
+of characters of the correct word. Vocabulary: 4 specials (`<pad>=0, <bos>=1, <eos>=2, <unk>=3`), a–z,
+apostrophe, hyphen, and any further character seen in the training/validation words.
+
+*Why characters (information argument).* The output space of a word classifier has one class per word;
+unseen words have **zero** probability mass. Writing the output as a sequence,
+
+```
+P(correct word | typed) = Π_t  P(c_t | c_<t , typed)
+```
+
+makes every string of up to 20 characters expressible, so `target_reachable` is 100% in principle. The
+parameters are shared across all words: the knowledge that `ph` sounds like `f` is learned once and
+applied everywhere. Concretely, a word-classifier's usable information about the correction of an
+unseen word `wnat` is **zero** (no neuron, and its ID embedding was never trained), while the character
+model uses the letters it contains. This is the single biggest change relative to v1/v2.
+
+### 6.2 The model (`CharSpeller`)
+
+A Transformer encoder-decoder:
+
+- Embedding: `E[id] · √d + P[position]` with `d = 256`, learned position embeddings (length 22).
+  `E` is initialised with standard deviation `d^−1/2`, so after the `√d` scaling embeddings have
+  roughly unit variance, comparable in scale to everything added to them.
+- **Encoder:** 4 layers of (multi-head self-attention, feed-forward 256→1024→256) with GELU, dropout
+  0.1, **pre-LayerNorm**, 8 heads, final LayerNorm. It reads the whole misspelled word at once (every
+  character can look at every other character).
+- **Decoder:** 4 layers with causal self-attention (a position cannot see future output characters),
+  cross-attention to the encoder output, GELU feed-forward, pre-LayerNorm.
+- **Output:** a linear layer whose weight matrix is **tied** to the embedding matrix
+  (`logits = h · Eᵀ`). Tying removes a vocabulary×256 matrix, and forces the input and output
+  character representations to agree.
+- Roughly 7 million parameters (the script prints the exact count).
+
+Attention, for reference: `Attention(Q,K,V) = softmax(Q Kᵀ / √d_k) V`. Each position's output is a
+weighted mixture of all values, so the information at *any* position is reachable from *any other* in
+**one** layer (path length 1), compared with `O(distance)` steps in a recurrent model.
+
+**Padding** is handled with boolean key-padding masks so padding never influences a real position; the
+decoder's causal mask is also boolean (mixing mask types is an error in recent PyTorch).
+
+### 6.3 Training the speller (`train_speller`)
+
+- **Teacher forcing:** the decoder input is the target shifted right (`<bos> w a n t`), and it must
+  predict the target (`w a n t <eos>`). The loss is the average over characters of
+  `−log P(correct char)`. Padding is excluded with `ignore_index`.
+- **Label smoothing 0.05:** the target distribution becomes `(1−ε)·one-hot + ε/K` (K = vocabulary).
+  This stops the network from driving logits to extremes, which improves the *calibration* of the
+  probabilities. Calibration matters here, because the pipeline thresholds on sequence probability.
+- **AdamW**, lr 1e-3 with the **OneCycle** schedule (10% warm-up from `lr/25`, then cosine decay to a
+  tiny value), weight decay 0.01, gradient clipping at 1.0, batch 512, up to 25 epochs.
+- **Mixed precision:** bf16 autocast on recent NVIDIA GPUs (no loss scaling needed), fp16 + `GradScaler`
+  on older ones, full precision on CPU. Only the model forward runs in low precision; the loss is
+  computed in float32.
+- **No GPU/CPU sync per step:** loss and gradient norm are accumulated as GPU tensors and converted
+  once per epoch.
+- **Validation each epoch:** loss and **exact-match accuracy** (greedy decoding on up to 4,000 validation
+  words). The "best" checkpoint is the one with the highest exact match; the "last" checkpoint is
+  saved every epoch. Early stopping after 5 epochs without improvement.
+
+### 6.4 Decision rules around the network (`SpellStage`)
+
+The raw network output is not trusted blindly. For every *distinct* token (results are cached) the
+rules are applied in this order (see `prime` and `_choose`):
+
+1. Not alphabetic, or shorter than 3 characters → unchanged. (Short words are too ambiguous and
+   punctuation/numbers are not spelling problems.)
+2. `dont, didnt, wasnt, cant, wont, ...` → the apostrophe form (a deterministic rule built from the
+   negation list).
+3. Not a known word, at least 4 characters, and within **1 edit** of an apostrophe-less negation
+   → that negation (`dident → didn't`). This is checked *before* any dictionary correction, because a
+   generic spell checker would turn `dident` into something like `dined`, silently deleting a negation.
+4. Otherwise ask the network for a proposal and its **sequence probability** `p`
+   (product of per-character probabilities including the end marker). A proposal is *usable* if it
+   differs from the token, is alphabetic, is within 3 edits, and does not add or remove a negation.
+   - If the token is **not** a known word: accept a usable proposal if the dictionary knows it **or**
+     `p ≥ 0.5` (the model is confident about a word the dictionary lacks, e.g. a rare inflection).
+   - If the token **is** a known word (`wen`, `their`): accept only if `p ≥ 0.9`, the proposal is a known
+     word, **and** the proposal is at least **50× more frequent** than the token. This is how
+     `wen → when` can be fixed without touching ordinary words.
+5. If nothing was accepted and the token is unknown: use `pyspellchecker`'s suggestion (if it does not
+   change the negation status). Otherwise leave it.
+
+"Known word" means: in the pyspellchecker English dictionary, **or** a correct word seen in your
+training data.
+
+*Why the dictionary is used as a check:* a neural decoder can produce a plausible but non-existent
+string. Requiring dictionary membership (or high confidence) filters hallucinations, using a
+different, independent source of evidence.
+
+---
+
+## 7. Stage 2: the tagger
+
+### 7.1 Why tagging, and what "tagging" means here
+
+The tagger gives each input token exactly one **label**, so the output can only keep, delete or edit
+words that exist. It can never rewrite a sentence freely. That structural limit is the first line of
+defence for meaning: `did not` can only change if the model emits a `<del>` or replacement label
+on `not`, and the guards (Section 7.6) catch even that.
+
+### 7.2 The label design (`to_label`, `apply_label`)
+
+| Label | Meaning | Example |
+|---|---|---|
+| `<copy>` | keep the token | `the → the` |
+| `<del>` | delete the token | `the the → the` |
+| `SUF|k|text` | cut the last `k` chars, append `text` | `walk→walked = SUF|0|ed`, `have→has = SUF|2|s`, `dogs→dog = SUF|1|` |
+| `REPL|text` | replace with `text` (can be several words) | `go→went = REPL|went`, `alot→a lot = REPL|a lot` |
+
+`SUF` is used when both tokens are alphabetic, share a prefix of at least 2 characters, cut at most 4
+and add at most 4 characters. Otherwise `REPL`.
+
+**The math of why shared edit labels help.** Let class `k` have `n_k` training examples. The error of
+estimating a categorical probability from `n` samples shrinks like `1/n` (variance of the estimate is
+`p(1−p)/n`). With word-specific labels (`REPL|walked`, `REPL|jumped`, `REPL|played`, ...) each class has
+`n_i` examples, mostly 1–3. With a shared label, one class collects
+`n = n_walked + n_jumped + n_played + ...`: the statistical strength is *pooled*. The label also
+**generalises to unseen verbs**, since `SUF|0|ed` is expressible for any base verb, whereas the label
+`REPL|<word>` cannot be produced for words not in the label set (the "reachability" problem from v1).
+
+Cost: it can also create a wrong word (`SUF|0|ed` applied to `go` gives `goed`). The network decides
+by context and the threshold limits low-confidence edits.
+
+### 7.3 The model (`SentenceTagger`)
+
+1. **Per-token features.** For each token, the string `"<" + token[:16] + ">"` is cut into all
+   character n-grams with `n = 1..5`; each n-gram is hashed with `zlib.crc32` (stable across runs,
+   unlike Python's `hash()`, which is randomised per process and would break a saved model) into one of
+   65,536 buckets. Tokens have at most 80 n-grams (padded with id 0, which is ignored). The token
+   vector is the **mean** of those n-gram embeddings (`EmbeddingBag`, 256-d) **plus** a whole-word
+   embedding (the hash of the word into 32,768 buckets).
+2. **Word dropout (15%, training only).** The whole-word vector of a random token is zeroed, so the
+   network must also work from n-grams and context alone. This matters because test words are, by design,
+   words it never trained on.
+3. `LayerNorm(char_vec + word_vec) + sinusoidal position + dropout(0.25)`.
+4. **Transformer encoder:** 4 layers, 4 heads, feed-forward 1024, GELU, dropout 0.25, pre-LayerNorm,
+   padding mask.
+5. A linear classifier to the number of labels.
+
+*Parameter count note:* about 25 of the ~28 million parameters are the two hashed embedding tables
+(`65,537×256 + 32,768×256`). The transformer body is only ~3 million. The tagger is "small" in
+compute and depth, not in raw parameter count; the tables are sparse lookups, so each example only
+touches a small fraction.
+
+### 7.4 Why character n-grams and hashing (information view)
+
+Treat a token as the *set* of its character n-grams `G(t)`. A word-ID representation makes `wnat` and
+`want` two unrelated integers (distance infinite). The n-gram set makes similarity graded. Worked
+example with the boundary markers `<` and `>`:
+
+```
+"<wnat>"  and  "<want>"      (a transposition)
+ n=1: both have {<,w,n,a,t,>}                 -> 6 shared of 6
+ n=2: {<w,wn,na,at,t>}  vs {<w,wa,an,nt,t>}   -> 2 shared ("<w", "t>")
+ n=3,4,5: no shared n-gram
+ total: 8 shared out of 20 + 20 distinct-slot n-grams  ->  Jaccard similarity = 8/32 = 0.25
+```
+
+Note the unigrams alone are **identical** for any transposition: a unigram bag cannot see the
+difference between `wnat` and `want`, and a whole-word ID sees only difference. Using `n = 1..5` gives
+the network both the overlap (to relate the misspelling to the right word) and the order-sensitive
+n-grams (to know *which* letters moved). Because the embeddings are **learned**, the network discovers
+which n-grams carry meaning (suffixes like `ed>` and `ing>`, for example). The mean of n-gram embeddings
+is the "fastText" idea: unseen words still receive a meaningful vector from their parts.
+
+*Cost of hashing.* Distinct n-grams are mapped to 65,536 buckets. If `D` distinct n-grams exist in the
+data, the fraction that shares a bucket with at least one other is about `1 − e^(−D/65536)`. For
+`D ≈ 50,000` that is about 53%. Collisions mix two n-grams' embeddings, which the network partly
+absorbs but cannot undo. Larger `ngram_buckets` is a direct, cheap knob (Section 14).
+
+### 7.5 Why a sentence-level Transformer (information view)
+
+The earlier window model gave a classifier a fixed `±k` tokens. The correct tense of `go` depends on
+`Yesterday`, which can be many tokens away; a window of ±3 is blind to it beyond 3 positions. In the
+encoder every token attends to every other token in one layer, so `Yesterday` at position 0 is directly
+reachable from the verb at position 9. Mutual information with the label is unchanged
+(`I(Y;X)` fixed) but **the information is now reachable by the predictor family**, that is `I_V`
+increases. Sinusoidal positions give the network order (self-attention alone is order-blind):
+
+```
+PE(pos, 2i)   = sin(pos / 10000^(2i/d))
+PE(pos, 2i+1) = cos(pos / 10000^(2i/d))
+```
+
+### 7.6 Training the tagger (`train_tagger`)
+
+- **Loss:** weighted cross-entropy with label smoothing 0.05 and `ignore_index=-100`.
+  The `<copy>` class has weight 0.4.
+  *Effect of the weight:* training with weight `w` on a class is equivalent to training on a
+  distribution where that class's prior is multiplied by `w`. So the posterior odds of "edit versus
+  copy" are inflated by `1/0.4 = 2.5×`. This makes the model less lazy (higher recall) at the price of
+  overstated edit probabilities, which is exactly what the **tuned threshold** then corrects.
+- **Optimizer:** AdamW (lr 5e-4, weight decay 0.01), OneCycle schedule, gradient clipping 1.0, batch 64
+  sentences, up to 60 epochs, early stop after 10 epochs without improvement.
+- **Per-epoch validation and threshold tuning** (`collect_tagger_outputs`, `best_threshold`).
+  For every validation token with a known label we compute the most probable *non-copy* label and its
+  probability `conf` (the `<copy>` probability is set to 0 before the max, so only edits compete). Then,
+  for thresholds 0.10, 0.15, ..., 0.95:
+  ```
+  predict edit if conf >= threshold else <copy>
+  P = correct edits / edits made        R = correct edits / edits needed
+  F0.5 = (1 + 0.5²) · P · R / (0.5² · P + R)
+  ```
+  The threshold with the highest F0.5 is stored in the checkpoint. **F0.5 weights precision four
+  times as much as recall** (in the `F_β` formula recall's weight is `β²`). This is the standard
+  choice in grammatical-error-correction research, because a wrong correction harms a reader more than
+  a missed one, and for dyslexic users a confidently wrong change is worse than a typo left in place.
+  - "Best" tagger checkpoint = highest validation F0.5, ties broken by lower validation loss.
+  - "Last" tagger checkpoint = saved every epoch.
+
+### 7.7 Inference rules and meaning guards (`TaggerPredictor._decide`)
+
+For each token, with `conf` the best non-copy probability:
+
+1. Required confidence = tuned threshold, **+0.10 for `<del>`** (deleting is more damaging than editing).
+   Below it → `<copy>`.
+2. If applying the label gives back the same text → `<copy>`.
+3. **Guard 1:** if the token is a negation and the result contains no negation → `<copy>`
+   (negations can't be removed or turned into non-negations).
+4. **Guard 2:** if the result contains a negation but the token was not one, and the result is more
+   than 2 character edits from the token → `<copy>` (negations can't be invented from nothing; a
+   close misspelling like `didnt → didn't` is allowed).
+
+The negation list covers `not, no, never, cannot` and the common contractions, **both with and without
+the apostrophe** (`didn't` and `didnt`), since dyslexic writing often drops the apostrophe.
+
+Sentences longer than 64 tokens are processed in 64-token chunks.
+
+---
+
+## 8. Exactly what each model receives
+
+### 8.1 Speller
+
+`width = max_word_len + 2 = 22`.
+
+- **`src`**: `LongTensor [B, 22]`. Characters mapped to ids, then `<eos>`, then `<pad>` (0) to width.
+- **`tgt`**: `LongTensor [B, 22]`: `<bos>`, characters of the correct word, `<eos>`, `<pad>`.
+- Training: input `src`, `tgt[:, :-1]` (21 positions); labels `tgt[:, 1:]` (21 positions).
+
+Example: `("wnat", "want")` with ids `w=a, n=b ...` (illustrative):
+```
+src      : w n a t <eos> <pad> <pad> ...
+tgt_in   : <bos> w a n t <eos> <pad> ...   (decoder input; all but the last position)
+tgt_out  : w a n t <eos> <pad> ...         (what it must predict)
+```
+
+### 8.2 Tagger
+
+Per batch (after trimming to the longest sentence `L` in the batch, at most 64):
+
+- `ngram_ids`: `[B, L, 80]` integers in `0..65536` (0 = padding), looked up on the GPU from a table
+  indexed by token row.
+- `word_ids`: `[B, L]` integers in `0..32767`.
+- `pad_mask`: `[B, L]` boolean (`True` where padding).
+- Labels (training/validation only): `[B, L]` integers, −100 for padding and for ignored labels.
+- Output: `logits [B, L, number_of_labels]`.
+
+(`80 = 18 + 17 + 16 + 15 + 14`: the number of n-grams of sizes 1 to 5 in a padded 18-character
+string, since `max_token_chars=16` plus 2 boundary markers.)
+
+### 8.3 One full worked example (illustrative, not a measured output)
+
+Training pair:
+
+```
+wrong   : She dont like coffe becuase it is to bitter.
+correct : She doesn't like coffee because it is too bitter.
+```
+
+1. `load_pairs` strips and keeps it; group key = `she doesn't like coffee because it is too bitter .`
+   (goes to one split with every other pair of that exact correct sentence).
+2. `tok(wrong)` = `[she, dont, like, coffe, becuase, it, is, to, bitter, .]`.
+3. Speller stage: `dont → don't` (rule 2), `coffe → coffee` and `becuase → because` (network, accepted
+   because the dictionary knows them); `to` is under 3 chars so it stays.
+   Result: `[she, don't, like, coffee, because, it, is, to, bitter, .]`.
+4. `align_outputs` against `tok(correct)` = `[she, doesn't, like, coffee, because, it, is, too, bitter, .]`:
+   same length, two replaced tokens.
+5. Labels: `[<copy>, REPL|doesn't, <copy>, <copy>, <copy>, <copy>, <copy>, SUF|0|o, <copy>, <copy>]`.
+   (20% of tokens edited, under the 60% rewrite limit, so it is kept. `to→too`: shared prefix `to`,
+   cut 0, add `o`. `don't→doesn't` contains an apostrophe so it is a `REPL`.)
+6. Tensors: `token rows [1, 64]`, then in the batch `ngram_ids [B, L, 80]`, etc. as in 8.2.
+
+At inference the same tokens pass through the same stages; the network predicts a label per token;
+thresholds and guards decide which are applied; `apply_label` writes the text.
+
+---
+
+## 9. How the optimization avoids the earlier failures
+
+This section explains the mechanisms in the code that target numerical and statistical failure modes.
+
+### 9.1 Vanishing and exploding gradients
+
+In a plain deep network `x_{l+1} = f(W_l x_l)`, backpropagation multiplies Jacobians:
+
+```
+∂L/∂x_l = ∂L/∂x_L · Π_{k=l}^{L-1} J_k
+```
+
+If the typical singular value of `J_k` is below 1 the product shrinks exponentially with depth
+(vanishing gradients); above 1 it explodes. Mechanisms used:
+
+| Mechanism | Where | Why it helps |
+|---|---|---|
+| **Residual connections** `x_{l+1} = x_l + F(x_l)` | every Transformer layer | `∂x_L/∂x_l = Π (I + ∂F_k/∂x)`; expanding the product contains an identity term, so gradient always has a direct path to early layers regardless of what `F` does. |
+| **Pre-LayerNorm** `x_{l+1} = x_l + F(LN(x_l))` | `norm_first=True` | The normalisation sits *inside* the residual branch, leaving the skip path unnormalised. Post-LN places the norm on the skip path and has been shown to give large gradients near the output at initialisation, needing careful warm-up; pre-LN trains stably with a short warm-up. |
+| **LayerNorm** `y = γ (x − μ)/σ + β` | before every sublayer and at the end | Keeps activations at a stable scale per token, independent of depth. |
+| **GELU** `x·Φ(x)` | feed-forward layers | Smooth, and nonzero gradient for negative inputs (ReLU has exactly zero gradient there, "dead neurons"). |
+| **Embedding scale** (`std = d^−1/2`, then `×√d`) | speller | Keeps the combined embedding+position signal at unit scale so neither dominates at the start. |
+| **Gradient clipping** `g ← g · min(1, c/‖g‖)` with `c = 1.0` | both trainings | Bounds the update after an unlucky batch (explosion). The global norm is **printed every epoch** (`grad_norm`): a value collapsing toward 0 over epochs signals vanishing gradients; sudden large values signal instability. |
+| **Warm-up + OneCycle** | both trainings | Starting at `lr_max/25` avoids the large destabilising first steps of Adam, when its running moment estimates are still poor; the cosine decay then lets the network settle. |
+| **AdamW** (decoupled weight decay) | both trainings | Weight decay acts on the weights directly, not mixed into the adaptive gradient scaling, so regularisation strength does not depend on gradient size. |
+| **Mixed precision: bf16 preferred** | CUDA | bf16 has the exponent range of float32 (8 bits), so small gradients do not underflow to zero; fp16 has only a 5-bit exponent and needs loss scaling (`GradScaler`). |
+
+### 9.2 Overfitting (the epoch-5 failure of v2)
+
+- Smaller, more regularised tagger (dropout 0.25, **word dropout**, weight decay).
+- **Synthetic data** multiplies the informative examples.
+- **Label smoothing** limits over-confidence on memorised examples.
+- **Early stopping on a *task* metric** (validation F0.5), not just the loss.
+- Shareable labels and rare-class ignoring reduce the number of rarely-seen classes the model can
+  memorise.
+
+### 9.3 Harmful edits
+
+| Defence | Mechanism |
+|---|---|
+| Tuned threshold | Chooses the confidence level maximising F0.5 on validation data instead of a guessed 0.30. |
+| Extra confidence for `<del>` | `+0.10` margin. |
+| Rewrite filter | `max_edit_ratio` removes pairs whose alignments are mostly noise. |
+| Rare labels ignored | Fewer spurious classes. |
+| Negation guards + negation rules in the speller | Meaning protection in *both* stages. |
+| Dictionary / frequency checks in the speller | Reject hallucinated words, and protect valid words. |
+
+### 9.4 The GPU looked idle
+
+Mitigations in this file: data resident on GPU; no per-step `.item()`/`float()` calls (accumulate
+tensors, read once per epoch); mixed precision; a bigger speller model. What remains inherently
+CPU-bound: reading CSVs, tokenizing, `SequenceMatcher` alignment, `crc32` hashing, building the
+tables, synthetic data generation, and the library's dictionary lookups. These are single-threaded
+Python. Seconds per epoch, which is printed, is the correct performance measure, not the utilisation
+graph.
+
+### 9.5 Everything that was changed relative to the earlier model, in one table
+
+| Earlier | Now | Why |
+|---|---|---|
+| One MLP over a ±k window | Speller (seq2seq) + tagger (sentence Transformer) | Different sub-problems, different output spaces, full-sentence context. |
+| Output = corrected word (closed set) | Spelling: characters (open). Grammar: `<copy>/<del>/SUF/REPL` | Reachability; pooled statistics. |
+| Skip unequal pairs | `SequenceMatcher` alignment | Keep run-together / split words. |
+| Row split / token-level split | Group split on raw pairs + assertion | Honest evaluation. |
+| Tagger trained on raw typos | Tagger trained on spell-corrected input | Same distribution at train and inference. |
+| Fixed 0.30 threshold | Threshold tuned for F0.5, delete margin | Fewer false edits. |
+| Lowercase only | Original case restored | Names and sentence starts survive. |
+| Negation guard on `didn't` only | Both spellings + speller rules + guards in both stages | Meaning protection. |
+| Window-MLP residual blocks | Pre-LN Transformers | Standard stable deep architecture. |
+| Per-step CPU syncs | GPU-side accumulation | GPU keeps working. |
+| Select checkpoint by loss | Speller: val exact match; tagger: val F0.5 | Select by what matters. |
+| No synthetic data | Dyslexia-style word noise; confusion-set sentence noise | More informative examples. |
+
+---
+
+## 10. Inference: how everything fits together
+
+`Corrector.correct_texts(texts)`:
+
+1. `tokens_cased` (original case) and a lowercase copy.
+2. `SpellStage.fix_tokens` on the lowercase tokens (distinct tokens batched through the GPU, cached).
+3. `TaggerPredictor.predict_labels` on the spell-corrected tokens (chunks of 64).
+4. For every token: `final = apply_label(spelled_token, label)`.
+   - Empty → dropped.
+   - `final` equal to the original lowercase token → the **original-case token is kept** (`Paris`,
+     `London`, `NASA` survive when untouched).
+   - Otherwise `match_case(original, final)`: ALL-CAPS stays caps, a capitalised word gets a capital.
+5. `detok`: join with spaces, remove the space before `. , ! ? ; : ) ] %`, and after `( [`.
+6. `restore_casing`: the standalone pronoun `i → I` and a capital letter at the start and after
+   `. ! ?`.
+
+`load_corrector("saved_model", which="best")` rebuilds the whole pipeline from the saved files. It
+always uses `speller_best.pt` (the tagger was trained on that speller's output), and
+`tagger_best.pt` or `tagger_last.pt`.
+
+---
+
+## 11. Evaluation: what is measured and how to read it
+
+All numbers are produced on the **held-out test split**. Always compare with the "do nothing"
+baselines in the same table.
+
+### 11.1 Speller table (`evaluate_speller`)
+
+Evaluated on up to 1,000 randomly chosen (seeded) test word pairs, words the model never saw:
+
+| Column | Meaning |
+|---|---|
+| `do_nothing` | accuracy of returning the typed word unchanged |
+| `model_only` | the network alone (no dictionary/rules) |
+| `library_only` | pyspellchecker alone |
+| `hybrid` | the real pipeline stage (network + dictionary + rules) |
+| `hybrid_keeps_correct_words` | feed the *correct* words in; fraction left unchanged. This is the "harm" measure. |
+
+You want `hybrid ≥ max(model_only, library_only)` and `hybrid_keeps_correct_words` near 1.
+
+### 11.2 Pipeline table
+
+Token level (tagger, with all guards):
+
+| Metric | Meaning |
+|---|---|
+| `accuracy` / `do_nothing_accuracy` | fraction of tokens with the right label; the baseline is the fraction needing no edit |
+| `edit_recall` | of tokens that needed an edit, the fraction fixed *exactly right* |
+| `edit_precision` | of edits made, the fraction exactly right |
+| `false_edit_rate` | of tokens that needed no edit, the fraction wrongly edited |
+| `target_reachable` | fraction of true labels that exist as classes (the ceiling on accuracy) |
+| `negations_broken` | count of negation tokens whose output lost the negation; should be 0 |
+
+Whole sentence (`spell_only`, `best`, `last`): `exact_match` (normalised sentence equals the reference),
+`char_error_rate` (Levenshtein distance between normalised sentences divided by the reference length),
+each with its `do_nothing_*` baseline. The `spell_only` column shows what the tagger adds beyond
+spelling.
+
+### 11.3 Demo sentences
+
+`DEMO_SENTENCES` has 10 hand-written sentences covering spelling, phonetics, negation, tense,
+agreement, homophones, run-together words and one already-correct sentence (it must be unchanged). It is
+a qualitative look, not a measurement.
+
+---
+
+## 12. Files produced, how to run, configuration reference
+
+```bash
+pip install pandas numpy rapidfuzz pyspellchecker
+pip install torch        # the CUDA build from pytorch.org for an NVIDIA GPU; torch >= 2.3
+python grammar_corrector.py
+```
+
+The first output line says `device: cuda (...)` if the GPU is used. Test first with
+`spell_epochs=2, tag_epochs=3, synthetic_pairs=5000` (edit in `Config`).
+
+`saved_model/` will contain: `speller_best.pt`, `speller_last.pt`, `tagger_best.pt`, `tagger_last.pt`
+(each with its config, vocabulary/labels, metrics, and the tuned threshold for taggers), and
+`report.json` (configuration, all tables, training histories with `grad_norm`, and demo outputs).
+
+### Configuration reference (`Config`)
+
+| Field | Default | Meaning / effect |
+|---|---|---|
+| `words_csv`, `sentences_csv` | your paths | data files |
+| `wrong_col`, `correct_col` | `incorrect`, `correct` | column names |
+| `output_dir` | `saved_model` | where checkpoints and report go |
+| `seed` | 42 | seeds Python, NumPy, torch; also the split |
+| `val_fraction`, `test_fraction` | 0.1, 0.1 | group split sizes |
+| `max_tokens` | 64 | longest sentence per chunk |
+| `max_word_len` | 20 | longest word the speller handles |
+| `max_edit_ratio` | 0.6 | drop pairs with more than this share of tokens edited |
+| `ngram_min`, `ngram_max` | 1, 5 | n-gram sizes for the tagger |
+| `max_token_chars` | 16 | characters per token considered for n-grams |
+| `ngram_buckets`, `word_buckets` | 65,536 / 32,768 | hash table sizes (collisions vs memory) |
+| `spell_d_model`, `spell_heads`, `spell_layers`, `spell_ff` | 256, 8, 4, 1024 | speller size |
+| `spell_dropout` | 0.1 | speller dropout |
+| `spell_batch`, `spell_epochs`, `spell_patience`, `spell_lr` | 512, 25, 5, 1e-3 | speller training |
+| `spell_val_cap`, `spell_eval_cap` | 4000, 1000 | words decoded for validation / test comparison |
+| `synthetic_pairs` | 200,000 | synthetic speller pairs |
+| `synthetic_clean_fraction` | 0.1 | share of identity pairs |
+| `synthetic_top_words` | 40,000 | dictionary words used as sources |
+| `real_repeat` | 3 | repeat count of real pairs |
+| `spell_min_len` | 3 | shortest word the speller touches |
+| `spell_max_edit` | 3 | farthest correction accepted |
+| `spell_accept_prob` | 0.5 | confidence needed for a proposal the dictionary doesn't know |
+| `rare_accept_prob`, `rare_word_ratio` | 0.9, 50 | rules for changing an already-valid word |
+| `tag_d_model`, `tag_heads`, `tag_layers`, `tag_ff` | 256, 4, 4, 1024 | tagger size |
+| `tag_dropout`, `word_dropout` | 0.25, 0.15 | regularisation |
+| `tag_batch`, `tag_epochs`, `tag_patience`, `tag_lr` | 64, 60, 10, 5e-4 | tagger training |
+| `synthetic_variants`, `synthetic_error_prob` | 6, 0.15 | synthetic sentences per source / swap chance per token |
+| `min_class_count` | 3 | rarer labels are ignored |
+| `copy_loss_weight` | 0.4 | down-weights `<copy>` |
+| `weight_decay`, `warmup_fraction`, `label_smoothing`, `grad_clip` | 0.01, 0.1, 0.05, 1.0 | shared training |
+| `default_edit_threshold` | 0.5 | used only if validation tuning is impossible |
+| `delete_extra_confidence` | 0.1 | extra confidence for `<del>` |
+| `max_negation_edit` | 2 | closest allowed edit when "creating" a negation |
+| `max_eval_sentences` | 5000 | cap on whole-sentence evaluation |
+
+---
+
+## 13. Limitations and gaps
+
+**Evidence.**
+- Not executed end to end by the author; no measured performance for this version.
+- The sentence file is small (~2,000 pairs). Validation/test sets are only ~200 sentences, so
+  threshold selection and checkpoint choice are noisy, and test metrics have wide error bars.
+- Your data's error style may differ from real dyslexic writing, and there is **no dyslexia-specific
+  real test set**. The model learns the error distribution of *your files*.
+
+**Modelling.**
+- **Cascade errors.** The tagger only sees what the speller output. If the speller wrongly changes a
+  word, the tagger cannot undo it.
+- **The speller is context-free.** `wen` could be `when` or `then`; only the sentence can decide, and
+  the speller never sees the sentence. (The rare-word rule picks the *most frequent plausible* one.)
+- **Real-word errors are the tagger's job and the tagger is data-starved.** `their/there`, `to/too` and
+  tense depend on ~100 hand-written confusion words and whatever your 2,000 sentences contain.
+- **Tense and irregular verbs** are only learnable for verbs that appear in the data or the confusion
+  groups. The model has no grammar knowledge beyond that.
+- **Independent per-token decisions.** The tagger can propose edits that conflict (no sequence-level
+  consistency such as a CRF).
+- **Insertions are weak.** A missing word can only be expressed as text appended to the *previous*
+  token's label, which makes a rare, sentence-specific label that usually falls under `min_class_count`
+  and is ignored. Missing-word errors are therefore largely uncorrectable.
+- **Alignment is heuristic.** `SequenceMatcher` finds longest matching blocks, not a minimum-edit
+  alignment, and `1→many`/`many→1` replacements are encoded by a convention (first token gets the
+  phrase, the rest are deleted).
+- **Exposure bias.** The speller trains on the spelling mistakes mined from *training* sentences, so on
+  training sentences it fixes them almost perfectly. The tagger's training inputs are therefore cleaner
+  than the inputs it will see on new text. This may make it slightly over-trust its input.
+- **Greedy decoding** in the speller (no beam search, no n-best list, no frequency re-ranking).
+- **Hash collisions** (Section 7.4), and the character n-gram vocabulary is capped at 16 characters per
+  token.
+- **Uniform word prior in the synthetic data.** The speller's implicit `P(word)` is not English
+  frequency.
+
+**Meaning protection.**
+- Only negations are protected. `without`, `nobody`, `nothing`, `none`, `neither`, `hardly`, numbers,
+  names, quantities and modal verbs are **not** guarded. The tagger could change them.
+- The fuzzy-negation rule picks the *first* apostrophe-less negation within 1 edit. Because the
+  negation list is a Python set (string hashing is randomised per process), when two candidates
+  qualify (for example `hasnt`/`hadnt`/`wasnt`) the choice can differ between runs. This is a small
+  determinism bug.
+
+**Engineering.**
+- Weight decay is applied to all parameters including LayerNorm and biases (usually these are excluded).
+- Validation threshold tuning ignores the delete margin and the negation guards, so the final tested
+  behaviour differs slightly from what was tuned.
+- `detok` is simple: quotes, dashes and line breaks are not handled; newlines and paragraphs are
+  flattened into one line.
+- The dictionary library's word list is a statistical English word list distributed with
+  `pyspellchecker`. It is not a neural model, but it is an external resource: state this in your
+  report if your project requires "no external data".
+- Time: `library_correct` and the evaluation of `library_only` can be slow on long words
+  (edit-distance-2 candidate search); this is why evaluation is capped at 1,000 words.
+
+---
+
+## 14. Improvements, ranked by effort
+
+### Easy (an hour or less, within the current architecture)
+
+| Improvement | Why / expected effect |
+|---|---|
+| **Fix the fuzzy-negation tie-break**: choose the candidate with the smallest edit distance, ties broken alphabetically | Removes run-to-run non-determinism. |
+| **Extend `NEGATIONS`** (`nobody, nothing, none, neither, nor, without, hardly`) and skip capitalised mid-sentence tokens | Wider meaning protection. |
+| **Exclude LayerNorm/bias/embeddings from weight decay** (two optimizer parameter groups) | Standard, usually small gain. |
+| **Increase `ngram_buckets`** (e.g. 2^18) if memory allows | Fewer hash collisions. |
+| **Extend `CONFUSION_GROUPS`** (more homophones and irregular verbs) | Directly widens what the tagger can learn. |
+| **Mine confusion pairs automatically**: from aligned 1-to-1 replacements in your sentence file where *both* words are dictionary words, add them to the confusion lookup | Learns your data's own real-word errors for synthetic generation. |
+| **Look at `report.json` histories**: `grad_norm`, train vs val loss | Verifies the optimisation claims on real runs. |
+| **Tune `copy_loss_weight`, `synthetic_variants`, `synthetic_error_prob`, `tag_dropout`** | The main levers for the tagger. |
+| **Apply the tagger twice** (re-run on its own output) | Fixes dependent errors (iterative correction as in GEC systems). Cheap to try. |
+
+### Medium (a day)
+
+| Improvement | Why / expected effect |
+|---|---|
+| **Beam search / n-best in the speller + rerank by word frequency** (noisy-channel: `log P_net + λ log P_freq`) | Repairs the uniform-prior caveat; `wen → when` becomes principled. |
+| **Context-aware spell reranking**: score each speller candidate by the tagger or a small word-level language model trained on your correct sentences | Resolves `when/then`. Needs the candidate list from the beam. |
+| **Measure your own error statistics**: align your word pairs at character level, count edit types, and sample synthetic noise from the *empirical* distribution instead of the hand-written table | Makes the synthetic noise match your real writers. |
+| **More clean sentences for synthetic generation** (any clean English text corpus is data, not a pretrained model) | Multiplies the tagger's training signal. Most effective improvement for the tagger's weakest part. |
+| **Temperature scaling** on validation logits | Better-calibrated confidences, thus better thresholds. |
+| **Separate thresholds per label type** (`SUF`, `REPL`, `DEL`) | Different error costs per type. |
+| **Checkpoint averaging** (average weights of the last few epochs) | Usually a free quality gain. |
+
+### Larger
+
+| Improvement | Why / expected effect |
+|---|---|
+| **Sentence-level seq2seq for the grammar stage** with a copy mechanism | Handles insertions and reordering; needs far more data. |
+| **CRF / sequence-level output for the tagger** | Consistent label sequences. |
+| **A real dyslexic-writing test set** (even 200 pairs hand-collected) | The only honest measure of the actual goal. |
+| **Standard GEC metrics** (M²/ERRANT-style F0.5) | Comparable to published work (note: ERRANT's tooling uses pretrained NLP models, so check your constraint). |
+| **Train a small word-level language model from your own correct text** for reranking | In-spirit "from scratch" substitute for pretrained LMs. |
+
+---
+
+## 15. Troubleshooting checklist
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| First line says `device: cpu` | CPU-only PyTorch build | Install the CUDA build from pytorch.org. |
+| `ModuleNotFoundError` | missing package | `pip install pandas numpy rapidfuzz pyspellchecker torch` |
+| Speller `val_exact` stuck near 0 | too few real pairs / too little training / learning rate | Check the printed `speller data` line; train longer; try `spell_lr=5e-4`. |
+| `grad_norm` → 0 across epochs | vanishing gradients | Lower dropout, check the learning rate; this should be rare with pre-LN. |
+| `grad_norm` spikes / loss NaN | instability | Lower `spell_lr`/`tag_lr`; check the data for empty strings. |
+| Tagger F0.5 = 0 on every epoch | validation set has no edits, or labels all ignored | Look at the printed class count and "tokens needing an edit"; lower `min_class_count`. |
+| Tagger worse than do-nothing | threshold too low / data too small | Raise `copy_loss_weight` toward 1; add more synthetic data; check `target_reachable`. |
+| `hybrid_keeps_correct_words` low | speller damages valid words | Raise `rare_accept_prob`, `rare_word_ratio`; add more identity pairs (`synthetic_clean_fraction`). |
+| Output loses line breaks / quotes | `detok` simplification | See Limitations. |
+| GPU out of memory | batch too large | Lower `spell_batch`, then `ngram_buckets`. |
+| Very slow start | single-threaded Python phases | Time them; cache built examples to disk if needed. |
+| Cannot load checkpoint | config changed after saving | Checkpoints store their own config; keep the code version that saved them. |
+
+---
+
+## 16. Glossary
+
+- **Token:** a word or one punctuation mark, produced by the regex tokenizer.
+- **Character n-gram:** a run of `n` consecutive characters (with `<`/`>` boundary markers).
+- **Hashing trick:** mapping an unbounded set (all n-grams) to a fixed number of buckets with a hash function.
+- **Embedding:** a learned vector looked up from an integer id.
+- **Transformer encoder / decoder:** stacks of attention + feed-forward layers; the decoder generates output one character at a time.
+- **Teacher forcing:** training the decoder with the *true* previous output characters as input.
+- **Greedy decoding:** at each step pick the single most likely next character.
+- **Group split:** splitting whole groups (same correct text) between train/val/test.
+- **Data leakage:** information from the evaluation data influencing training, making scores too optimistic.
+- **Label smoothing:** training toward `(1−ε)·one-hot + ε/K` instead of a pure one-hot target.
+- **Calibration:** whether a predicted probability of 0.8 is right about 80% of the time.
+- **F0.5:** the F-score that weights precision more than recall.
+- **Data processing inequality:** `I(Y;T(X)) ≤ I(Y;X)`; processing cannot create information.
+- **Usable (V-)information:** information a given model family can actually extract.
+- **Pre-LayerNorm:** normalisation placed inside the residual branch.
+- **Vanishing / exploding gradients:** gradients shrinking or growing exponentially with depth during backpropagation.
+- **Exposure bias:** a mismatch between training inputs and the inputs seen when the system is used.
