@@ -379,7 +379,7 @@ def corrupt_word(word: str, rng: random.Random) -> str:
     """Letter swaps, omissions, doubled letters, phonetic spellings, vowel confusions."""
     for _ in range(10):                         # retry until the result really differs
         w = word
-        for _ in range(rng.choice([1, 1, 1, 2, 2, 3])):
+        for _ in range(rng.choice([1, 1, 1, 1, 2, 2])):
             op = rng.choice(_NOISE_OPS)
             if op == "swap" and len(w) >= 2:
                 i = rng.randrange(len(w) - 1)
